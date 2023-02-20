@@ -13,6 +13,7 @@ library(randplot)
 library(showtext)
 library(ggh4x)
 library(gmapsdistance)
+library(dotwhisker)
 
 
 # plot settings
@@ -98,10 +99,11 @@ data %>%
   base_theme + 
   ylab("Price (thousands)") + 
   xlab("Sold date") + 
-  labs(title = "Prices peaked in Garner when rates reached 7%") + 
+  #labs(title = "Prices peaked in Garner when rates reached 7%") + 
   scale_y_continuous(labels = ~paste0("$ ",.x)) + 
-  facet_wrap(~beds, labeller = "label_both") + 
-  annotate("text", x = as.POSIXct(as.Date("2022-11-10")), y = 650, label = "Oct 10th")
+  #annotate("text", x = as.POSIXct(as.Date("2022-11-10")), y = 650, label = "Oct 10th")+
+  facet_wrap(~beds, labeller = "label_both", ncol = 1, scales = "free")  
+  
 
 
 
@@ -135,14 +137,34 @@ data %>%
   facet_wrap(facets = ~property_type)
 
 
+# Can we control for stuff and do a time-varying estimation:
+
+reg_data <- data %>%
+  mutate(m. = paste0(year(sold_date), ".", str_pad(month(sold_date), width = 2, pad = "0") )) %>%
+  filter(beds %in% 3:4) %>%
+  # Only "new" homes - sold within 1 year of year_built
+  filter(year(sold_date) <= year_built + 1) %>%
+  mutate(sq_ft.250 =  (square_feet - mean(square_feet)) / 250) %>%
+  mutate(beds = beds - 2)
+
+m0 <- lm(price ~ sq_ft.250, data = reg_data)
+  
+m1 <- update(m0, . ~ . + beds)
+
+m2 <- update(m1, . ~ . +  + property_type)
+
+m3 <- update(m2, . ~ . +  + m.)
+
+
+dwplot(list(m0, m1, m2, m3)) + base_theme
 
 # parallel coordinates plots:
-library(GGally)
-
-par_columns <- which(names(data) %in% c("price", "mins_to_church", "year_built")) 
-
-ggparcoord(data,
-           columns = par_columns,
-           groupColumn = "city",
-           scale = "uniminmax") +
-  scale_color_brewer(palette = "Set2")
+# library(GGally)
+# 
+# par_columns <- which(names(data) %in% c("price", "mins_to_church", "year_built")) 
+# 
+# ggparcoord(data,
+#            columns = par_columns,
+#            groupColumn = "city",
+#            scale = "uniminmax") +
+#   scale_color_brewer(palette = "Set2")
