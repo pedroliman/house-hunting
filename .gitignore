@@ -7,3 +7,10 @@
 *.js
 *.woff
 *.html
+
+# Python / uv
+__pycache__/
+*.pyc
+python/.venv/
+python/cache/
+.venv/
