@@ -77,13 +77,35 @@ USER_AGENT = "lake-house-finder/0.1 (https://github.com/pedroliman/house-hunting
 # ---------------------------------------------------------------------------
 
 def geocode_location(query: str) -> tuple[float, float]:
-    """Resolve a free-form location string to (lat, lon) via Nominatim."""
+    """Resolve a free-form location string to (lat, lon) via Nominatim.
+
+    Results are cached on disk under python/cache/geocode.json to stay under
+    the Nominatim 1 req/sec policy across repeated runs.
+    """
+    import json
+
+    cache_file = CACHE_DIR / "geocode.json"
+    try:
+        cache = json.loads(cache_file.read_text()) if cache_file.exists() else {}
+    except Exception:
+        cache = {}
+
+    key = query.strip().lower()
+    if key in cache:
+        lat, lon = cache[key]
+        return float(lat), float(lon)
+
     from geopy.geocoders import Nominatim
 
     geolocator = Nominatim(user_agent=USER_AGENT)
     loc = geolocator.geocode(query, country_codes="us", timeout=30)
     if loc is None:
         raise RuntimeError(f"Could not geocode location: {query!r}")
+    cache[key] = [float(loc.latitude), float(loc.longitude)]
+    try:
+        cache_file.write_text(json.dumps(cache, indent=2))
+    except Exception:
+        pass
     return float(loc.latitude), float(loc.longitude)
 
 
@@ -333,6 +355,114 @@ def distance_to_nearest_lake(listings_df: "pd.DataFrame", lakes_gdf) -> "pd.Data
     return listings_df
 
 
+POSITIVE_WATERFRONT_KEYWORDS = [
+    "lakefront", "lake front", "lake-front",
+    "waterfront", "water front", "water-front",
+    "on the lake", "on the water",
+    "lake frontage", "water frontage",
+    "private dock", "boat dock", "boat slip", "boat house", "boathouse",
+    "pier", "water access", "lake access",
+    "lake view", "views of the lake",
+    "at the lake",
+]
+
+# If a description contains ONLY pond-y words (and none of the strong
+# waterfront phrases), we suppress the lakefront signal.
+POND_ONLY_KEYWORDS = ["pond", "community pond", "neighborhood pond"]
+
+
+def _lakefront_confidence(row) -> float:
+    """Heuristic 0..1 score that a listing is *actually* on a lake.
+
+    Combines:
+      - How close the listed point is to the nearest lake polygon.
+      - Whether the estimated lot radius (from lot_sqft) can plausibly
+        reach the water from the listed point.
+      - Waterfront keywords in the listing description/text.
+    """
+    import math as _m
+
+    dist = float(row.get("lake_dist_m") or 1e9)
+    lot_sqft = row.get("lot_sqft")
+    text = (row.get("text") or "")
+    if not isinstance(text, str):
+        text = ""
+    text_lc = text.lower()
+
+    # 1) Geometric signal: does the parcel plausibly touch water?
+    # Approximate the lot as a circle with area = lot_sqft (in m^2); compare
+    # its radius to the house-point-to-lake distance. If the radius >= the
+    # distance, the parcel boundary likely intersects the water.
+    try:
+        lot_m2 = float(lot_sqft) * 0.09290304 if lot_sqft else 0.0
+    except (TypeError, ValueError):
+        lot_m2 = 0.0
+    lot_radius_m = _m.sqrt(lot_m2 / _m.pi) if lot_m2 > 0 else 0.0
+    edge_dist_m = max(0.0, dist - lot_radius_m)
+
+    # Geometric score (closer edge -> higher).
+    if edge_dist_m <= 0:
+        geom = 1.0
+    elif edge_dist_m <= 15:
+        geom = 0.85
+    elif edge_dist_m <= 40:
+        geom = 0.6
+    elif edge_dist_m <= 80:
+        geom = 0.3
+    else:
+        geom = 0.0
+
+    # 2) Text signal.
+    pos_hits = sum(1 for kw in POSITIVE_WATERFRONT_KEYWORDS if kw in text_lc)
+    has_pos = pos_hits > 0
+    has_pond = any(kw in text_lc for kw in POND_ONLY_KEYWORDS) and not has_pos
+
+    text_score = 0.0
+    if has_pos:
+        # Diminishing returns past a couple of hits.
+        text_score = min(1.0, 0.5 + 0.25 * pos_hits)
+    if has_pond:
+        text_score = -0.3  # penalty: likely community pond, not a lake
+
+    # 3) Hard overrides: very close to water alone deserves high confidence.
+    if dist <= 15:
+        point_bonus = 0.4
+    elif dist <= 40:
+        point_bonus = 0.2
+    else:
+        point_bonus = 0.0
+
+    conf = 0.55 * geom + 0.35 * text_score + point_bonus
+    return max(0.0, min(1.0, conf))
+
+
+def add_lakefront_confidence(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Attach lakefront_conf + supporting columns."""
+    import math as _m
+
+    out = df.copy()
+    # Populate supporting columns for CSV transparency.
+    lot_m2 = out.get("lot_sqft")
+    if lot_m2 is not None:
+        radii = []
+        for v in lot_m2:
+            try:
+                x = float(v) * 0.09290304
+                radii.append(_m.sqrt(x / _m.pi) if x > 0 else 0.0)
+            except (TypeError, ValueError):
+                radii.append(0.0)
+        out["lot_radius_m"] = radii
+        out["edge_dist_m"] = (
+            out["lake_dist_m"].astype(float) - out["lot_radius_m"]
+        ).clip(lower=0.0)
+    else:
+        out["lot_radius_m"] = 0.0
+        out["edge_dist_m"] = out["lake_dist_m"].astype(float)
+
+    out["lakefront_conf"] = out.apply(_lakefront_confidence, axis=1)
+    return out
+
+
 def score_value(
     df: "pd.DataFrame", weight_price: float, weight_lake: float
 ) -> "pd.DataFrame":
@@ -384,6 +514,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Minimum number of bedrooms.")
     p.add_argument("--max-lake-distance-m", type=float, default=500.0,
                    help="Keep only listings within this many meters of a lake.")
+    p.add_argument("--min-lakefront-conf", type=float, default=0.0,
+                   help="Drop listings whose lakefront_conf is below this "
+                        "(0..1). 0.7 is a good 'truly lakefront' filter.")
+    p.add_argument("--lakefront-only", action="store_true",
+                   help="Shortcut for --min-lakefront-conf 0.7.")
     p.add_argument("--min-lake-area-m2", type=float, default=10_000.0,
                    help="Drop waterbodies smaller than this (filters tiny ponds "
                         "and also ocean polygons if set large).")
@@ -450,23 +585,41 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[filter] {len(near)} listings within {args.max_lake_distance_m:.0f} m of a lake",
           file=sys.stderr)
 
-    if near.empty:
+    if len(near) == 0:
         print("No listings within the lake-distance threshold.", file=sys.stderr)
         return 2
 
+    near = add_lakefront_confidence(near)
+    min_conf = 0.7 if args.lakefront_only else args.min_lakefront_conf
+    if min_conf > 0:
+        before = len(near)
+        near = near[near["lakefront_conf"] >= min_conf].copy()
+        print(f"[filter] {len(near)}/{before} listings pass "
+              f"lakefront_conf >= {min_conf:.2f}", file=sys.stderr)
+
+    if len(near) == 0:
+        print("No listings meet the lakefront-confidence threshold.",
+              file=sys.stderr)
+        return 2
+
     scored = score_value(near, args.weight_price, args.weight_lake)
-    scored = scored.sort_values("value_score", ascending=False)
+    scored = scored.sort_values(
+        ["lakefront_conf", "value_score"], ascending=[False, False]
+    )
 
     # Pick display columns that are commonly present.
     display_cols = [c for c in (
-        "address", "list_price", "beds", "baths", "sqft",
-        "price_per_sqft", "lake_dist_m", "value_score", "property_url",
+        "formatted_address", "address", "list_price", "beds", "sqft",
+        "price_per_sqft", "lake_dist_m", "edge_dist_m", "lakefront_conf",
+        "value_score", "property_url",
     ) if c in scored.columns]
 
     top = scored.head(args.top)
     print(tabulate(
         top[display_cols].round({"price_per_sqft": 0,
                                  "lake_dist_m": 0,
+                                 "edge_dist_m": 0,
+                                 "lakefront_conf": 2,
                                  "value_score": 3}),
         headers="keys", tablefmt="github", showindex=False,
     ))
