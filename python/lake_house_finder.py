@@ -209,44 +209,46 @@ def load_lakes(fips_list: Iterable[str], min_area_m2: float):
 def fetch_listings(
     location: str,
     radius_miles: float,
-    source: str,
     max_price: float | None,
+    min_beds: int,
 ) -> "pd.DataFrame":
-    """Fetch for-sale listings using homeharvest. Returns a DataFrame."""
+    """Fetch for-sale listings via homeharvest (Realtor.com backend)."""
     try:
         from homeharvest import scrape_property
     except ImportError as e:
         raise RuntimeError(
-            "homeharvest is required. Install with: `uv sync` or "
-            "`uv run python/lake_house_finder.py` (which pulls PEP-723 deps)."
+            "homeharvest is required. Run via `uv run python/lake_house_finder.py` "
+            "(the PEP 723 header pulls all deps automatically) or `uv sync` "
+            "inside ./python."
         ) from e
 
-    # homeharvest uses site_name ∈ {"redfin","zillow","realtor.com"}
+    # Current homeharvest (>=0.4) scrapes Realtor.com only. The older
+    # `site_name` kwarg for redfin/zillow is gone. Realtor.com listings cover
+    # both Redfin and Zillow inventories in practice (same MLS feeds).
     try:
         df = scrape_property(
             location=location,
             listing_type="for_sale",
-            site_name=source,
             radius=radius_miles,
+            price_max=int(max_price) if max_price is not None else None,
+            beds_min=min_beds if min_beds > 0 else None,
+            exclude_pending=True,
         )
     except Exception as e:
         raise RuntimeError(
-            f"Listing scrape from {source!r} failed: {e}\n"
-            f"Workaround: export a CSV manually from Redfin/Zillow and pass "
-            f"it with --listings-csv."
+            f"Listing scrape failed: {e}\n"
+            f"Workaround: export a CSV manually from Redfin/Zillow/Realtor "
+            f"and pass it with --listings-csv."
         ) from e
 
-    if df is None or df.empty:
-        raise RuntimeError(f"No listings returned from {source!r}.")
+    if df is None or len(df) == 0:
+        raise RuntimeError("No listings returned.")
 
-    # Normalize column names that homeharvest may use
+    # Normalize column names. homeharvest returns 'list_price' already in
+    # recent versions but older schemas used 'price'.
     rename = {}
-    for src, dst in [
-        ("price", "list_price"),
-        ("sold_price", "list_price"),  # shouldn't happen for for_sale
-    ]:
-        if src in df.columns and dst not in df.columns:
-            rename[src] = dst
+    if "list_price" not in df.columns and "price" in df.columns:
+        rename["price"] = "list_price"
     df = df.rename(columns=rename)
 
     needed = {"latitude", "longitude", "list_price"}
@@ -254,7 +256,7 @@ def fetch_listings(
     if missing:
         raise RuntimeError(
             f"Listings frame is missing expected columns: {missing}. "
-            f"Got: {sorted(df.columns)}"
+            f"Got: {sorted(df.columns)[:20]}..."
         )
 
     df = df.dropna(subset=["latitude", "longitude", "list_price"]).copy()
@@ -379,9 +381,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--min-lake-area-m2", type=float, default=10_000.0,
                    help="Drop waterbodies smaller than this (filters tiny ponds "
                         "and also ocean polygons if set large).")
-    p.add_argument("--source", choices=["redfin", "zillow", "realtor.com"],
-                   default="redfin",
-                   help="Which listing site homeharvest should scrape.")
     p.add_argument("--listings-csv", type=Path, default=None,
                    help="Bypass scraping; read listings from this CSV "
                         "(must have latitude, longitude, list_price columns).")
@@ -420,23 +419,22 @@ def main(argv: list[str] | None = None) -> int:
         listings = load_listings_csv(args.listings_csv)
         if args.max_price is not None:
             listings = listings[listings["list_price"] <= args.max_price]
+        if args.min_beds > 0 and "beds" in listings.columns:
+            listings = listings[
+                pd.to_numeric(listings["beds"], errors="coerce") >= args.min_beds
+            ]
     else:
-        print(f"[listings] scraping {args.source} around {args.location!r} "
+        print(f"[listings] scraping Realtor.com around {args.location!r} "
               f"(radius {args.radius_miles} mi)", file=sys.stderr)
         listings = fetch_listings(
-            args.location, args.radius_miles, args.source, args.max_price
+            args.location, args.radius_miles, args.max_price, args.min_beds
         )
-    print(f"[listings] {len(listings)} candidates after price filter",
+    print(f"[listings] {len(listings)} candidates after price/beds filter",
           file=sys.stderr)
 
-    if listings.empty:
+    if len(listings) == 0:
         print("No listings found matching price filter.", file=sys.stderr)
         return 2
-
-    if args.min_beds > 0 and "beds" in listings.columns:
-        listings = listings[
-            pd.to_numeric(listings["beds"], errors="coerce") >= args.min_beds
-        ]
 
     listings = distance_to_nearest_lake(listings, lakes)
     near = listings[listings["lake_dist_m"] <= args.max_lake_distance_m].copy()

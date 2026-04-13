@@ -66,8 +66,11 @@ at `--output`. Progress goes to stderr so stdout stays pipe-friendly.
    waterbody polygons whose MTFCC ∈ {`H2030` lake/pond, `H2040` reservoir,
    `H2050` bay/estuary/cove}. Waterbodies smaller than
    `--min-lake-area-m2` (default 10,000 m²) are discarded.
-4. **Scrape listings** with the `homeharvest` library against the chosen
-   site (`redfin` | `zillow` | `realtor.com`).
+4. **Scrape listings** with the `homeharvest` library. Current
+   `homeharvest` (>=0.4) scrapes **Realtor.com**, which is fed by the same
+   MLS feeds as Redfin and Zillow (so the inventory overlaps heavily). If
+   you prefer Redfin- or Zillow-specific listings, export a CSV from their
+   site and use `--listings-csv`.
 5. **Distance**: project both layers to EPSG:5070 (CONUS Albers Equal Area)
    and use `geopandas.sjoin_nearest` to attach a `lake_dist_m` column to
    each listing.
@@ -96,8 +99,7 @@ are fast.
 | `--min-beds` | `0` | Drop listings with fewer bedrooms. |
 | `--max-lake-distance-m` | `500` | Proximity threshold to the nearest lake edge. |
 | `--min-lake-area-m2` | `10000` | Drop tiny ponds / (if raised) ocean polygons. |
-| `--source` | `redfin` | One of `redfin`, `zillow`, `realtor.com`. |
-| `--listings-csv` | `None` | Bypass scraping — read pre-exported listings. |
+| `--listings-csv` | `None` | Bypass scraping — read pre-exported listings (CSV with `latitude,longitude,list_price` columns, plus optional `beds`, `sqft`, `property_url`, `address`). |
 | `--weight-price` | `0.6` | Weight on price/sqft in value score. |
 | `--weight-lake`  | `0.4` | Weight on lake proximity in value score. |
 | `--top` | `20` | Print the top N rows. |
@@ -110,10 +112,11 @@ are fast.
 ## Caveats (please read)
 
 - **Scraping is fragile.** Neither Redfin nor Zillow publish a free public
-  listing API. `homeharvest` is a best-effort scraper; if the site changes
-  its frontend the scrape will break. When it does, export a CSV manually
-  from the site's map search and re-run with
-  `--listings-csv my_export.csv`.
+  listing API, and `homeharvest` currently only scrapes Realtor.com. If
+  the upstream scraper breaks, export a CSV manually from Redfin/Zillow's
+  map search and re-run with `--listings-csv my_export.csv`. Realtor.com
+  does draw from the same MLS feeds as Redfin and Zillow in most markets,
+  so the inventory usually overlaps ~fully.
 - **TIGER AREAWATER is coarser than USGS NHD.** Very small ponds may be
   missing. Conversely, very large polygons (Pamlico Sound, the Atlantic
   near coastal NC) share MTFCC `H2050` and would otherwise swamp results;
