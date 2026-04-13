@@ -210,6 +210,7 @@ def fetch_listings(
     location: str,
     radius_miles: float,
     max_price: float | None,
+    min_price: float | None,
     min_beds: int,
 ) -> "pd.DataFrame":
     """Fetch for-sale listings via homeharvest (Realtor.com backend)."""
@@ -231,6 +232,7 @@ def fetch_listings(
             listing_type="for_sale",
             radius=radius_miles,
             price_max=int(max_price) if max_price is not None else None,
+            price_min=int(min_price) if min_price is not None else None,
             beds_min=min_beds if min_beds > 0 else None,
             exclude_pending=True,
         )
@@ -262,6 +264,8 @@ def fetch_listings(
     df = df.dropna(subset=["latitude", "longitude", "list_price"]).copy()
     if max_price is not None:
         df = df[df["list_price"] <= max_price]
+    if min_price is not None:
+        df = df[df["list_price"] >= min_price]
     return df.reset_index(drop=True)
 
 
@@ -372,6 +376,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help='e.g. "Raleigh, NC" or "27601".')
     p.add_argument("--radius-miles", type=float, default=25.0,
                    help="Search radius around the geocoded location.")
+    p.add_argument("--min-price", type=float, default=None,
+                   help="Minimum list price in USD (e.g. 400000).")
     p.add_argument("--max-price", type=float, default=None,
                    help="Maximum list price in USD (e.g. 550000).")
     p.add_argument("--min-beds", type=int, default=0,
@@ -419,6 +425,8 @@ def main(argv: list[str] | None = None) -> int:
         listings = load_listings_csv(args.listings_csv)
         if args.max_price is not None:
             listings = listings[listings["list_price"] <= args.max_price]
+        if args.min_price is not None:
+            listings = listings[listings["list_price"] >= args.min_price]
         if args.min_beds > 0 and "beds" in listings.columns:
             listings = listings[
                 pd.to_numeric(listings["beds"], errors="coerce") >= args.min_beds
@@ -427,7 +435,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[listings] scraping Realtor.com around {args.location!r} "
               f"(radius {args.radius_miles} mi)", file=sys.stderr)
         listings = fetch_listings(
-            args.location, args.radius_miles, args.max_price, args.min_beds
+            args.location, args.radius_miles,
+            args.max_price, args.min_price, args.min_beds,
         )
     print(f"[listings] {len(listings)} candidates after price/beds filter",
           file=sys.stderr)
